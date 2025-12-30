@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <FlexCAN_T4.h>
 
-// Choose CAN controller: CAN1 is the usual default pins on Teensy 4.1 (TX=22, RX=23)
-//test commit
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can;
 
 static CAN_message_t txMsg;
@@ -22,27 +20,35 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   Serial.begin(SERIAL_BAUD);
-  while (!Serial && millis() < 1500) {} // don't hang forever if serial not attached
-
+  delay(300);
   Serial.printf("\nBoot NODE_ID=%d\n", NODE_ID);
 
   Can.begin();
   Can.setBaudRate(CAN_BAUD);
-
-  // Optional: enable FIFO for smoother reads
-  // Can.enableFIFO();
-  // Can.enableFIFOInterrupt();  // not needed for polling bring-up
 }
 
+elapsedMillis heartbeat;
+
 void loop() {
-  // 100 Hz transmit
+  // Heartbeat every 1 second
+  static elapsedMillis txBeat;
+  if (txBeat > 1000) {
+    txBeat = 0;
+    Serial.printf("NODE %d TX id=0x%03X\n", NODE_ID, 0x100 + NODE_ID);
+  }
+
+  if (heartbeat > 1000) {
+    heartbeat = 0;
+    Serial.printf("NODE %d alive\n", NODE_ID);
+  }
+
+  // Send CAN every 10 ms
   if (txTimer >= 10) {
     txTimer = 0;
 
-    txMsg.id  = 0x100 + NODE_ID;   // Node A = 0x101, Node B = 0x102
+    txMsg.id  = 0x100 + NODE_ID;
     txMsg.len = 8;
 
-    // payload: [0..3] seq, [4..7] millis
     uint32_t ms = millis();
     memcpy(&txMsg.buf[0], &seq, sizeof(seq));
     memcpy(&txMsg.buf[4], &ms,  sizeof(ms));
@@ -51,14 +57,13 @@ void loop() {
     Can.write(txMsg);
   }
 
-  // Poll receive
+  // Read CAN
   while (Can.read(rxMsg)) {
-    // If you want: only react to the other node’s ID range
-    // (e.g. ignore your own frames if they loop back on some transceivers)
     const uint32_t otherId = 0x100 + (NODE_ID == 1 ? 2 : 1);
     if (rxMsg.id == otherId) {
-      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+      digitalToggle(LED_BUILTIN);
     }
     printFrame(rxMsg);
   }
 }
+
