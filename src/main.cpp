@@ -2,6 +2,7 @@
 #include <FlexCAN_T4.h>
 
 // Choose CAN controller: CAN1 is the usual default pins on Teensy 4.1 (TX=22, RX=23)
+//test commit
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can;
 
 static CAN_message_t txMsg;
