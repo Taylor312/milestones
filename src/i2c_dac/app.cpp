@@ -1,109 +1,84 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-//Multimetertesting
-// Pins are on Teensy 4.1: SDA=18, SCL=19 (Wire default)
-// If you ever want to force pins: Wire.setSDA(18); Wire.setSCL(19);
+// --- CONFIGURATION ---
+// Set this to a spare pin for oscilloscope visualization
+#define SCOPE_PIN 2 
+// I2C Clock Speed: 400kHz is standard "Fast Mode"
+#define I2C_SPEED 400000 
+// #define I2C_SPEED 800000 // Uncomment to try overclocking (some MCP4725s handle it)
 
-#ifndef SERIAL_BAUD
-  #define SERIAL_BAUD 115200
-#endif
-
-// MCP4725 default I2C address is usually 0x60.
-// Some boards can be 0x61 depending on A0 strap.
-static const uint8_t DAC_ADDR_DEFAULT = 0x60;
-
-static uint8_t g_dacAddr = DAC_ADDR_DEFAULT;
-
-static bool i2cDevicePresent(uint8_t addr) {
-  Wire.beginTransmission(addr);
-  return (Wire.endTransmission() == 0);
-}
-
-// Write a 12-bit value (0..4095) to MCP4725 DAC.
-// This uses "fast mode" write: [0b000xxxxx][high data][low data]
-// For MCP4725 fast mode, command byte is 0b0000xxxx where upper bits are 0000.
-// Many libs just send: (value >> 8), (value & 0xFF) but *proper* fast format is:
-// byte0: 0b0000 (cmd) + upper 4 bits of value
-// byte1: lower 8 bits of value
-static void mcp4725WriteFast(uint16_t value12) {
-  value12 &= 0x0FFF;
-
-  uint8_t byte0 = (uint8_t)(value12 >> 8);      // upper 4 bits are in low nibble
-  uint8_t byte1 = (uint8_t)(value12 & 0xFF);
-
-  Wire.beginTransmission(g_dacAddr);
-  Wire.write(byte0);
-  Wire.write(byte1);
-  Wire.endTransmission();
-}
+static const uint8_t DAC_ADDR = 0x60;
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  pinMode(SCOPE_PIN, OUTPUT);
+  digitalWrite(SCOPE_PIN, LOW);
 
-  Serial.begin(SERIAL_BAUD);
-  delay(250);
-  Serial.println("\n[M2] I2C DAC (MCP4725) test starting...");
+  Serial.begin(115200);
+  
+  // Wait for Serial to attach so we don't miss the first prints
+  while (!Serial && millis() < 2000); 
+
+  Serial.println("\n[M2.5] I2C DAC Speed Test");
+  Serial.printf("Target I2C Clock: %d Hz\n", I2C_SPEED);
 
   Wire.begin();
-  Wire.setClock(400000); // 400kHz I2C (MCP4725 supports it)
-
-  // Scan just the likely addresses first
-  if (i2cDevicePresent(0x60)) {
-    g_dacAddr = 0x60;
-    Serial.println("Found MCP4725 at 0x60");
-  } else if (i2cDevicePresent(0x61)) {
-    g_dacAddr = 0x61;
-    Serial.println("Found MCP4725 at 0x61");
-  } else {
-    Serial.println("ERROR: No MCP4725 found at 0x60/0x61.");
-    Serial.println("Check wiring: SDA=18, SCL=19, 3.3V, GND. (Also pullups if needed.)");
-  }
+  Wire.setClock(I2C_SPEED);
 }
 
 void loop() {
-  static elapsedMillis t;
-  static uint16_t value = 0;
-  static int step = 32;           // step size in DAC counts
-  static bool rising = true;
+  static uint32_t lastPrint = 0;
+  static uint32_t transactionCount = 0;
+  static uint32_t maxTime = 0;
+  static uint32_t minTime = 9999;
+  static uint32_t totalTime = 0;
 
-  // Update ~200 Hz (every 5 ms)
-  if (t >= 5) {
-    t = 0;
+  // 1. Prepare Data (Dummy value)
+  uint16_t value12 = 2048; 
+  uint8_t byte0 = (uint8_t)((value12 >> 8) & 0x0F); // Fast Write Command (0000) + Upper 4 bits
+  uint8_t byte1 = (uint8_t)(value12 & 0xFF);        // Lower 8 bits
 
-    // If we never found the DAC, just blink slow to show code is alive
-    if (!i2cDevicePresent(g_dacAddr)) {
-      static elapsedMillis blinkT;
-      if (blinkT > 500) {
-        blinkT = 0;
-        digitalToggle(LED_BUILTIN);
-        Serial.println("No DAC detected (still running).");
-      }
-      return;
-    }
+  // 2. Start Timing
+  digitalWriteFast(SCOPE_PIN, HIGH); // Scope Trigger: RISING edge = Start
+  uint32_t tStart = micros();
 
-    // Write DAC
-    mcp4725WriteFast(value);
+  // 3. I2C Transaction
+  // Note: On Teensy, beginTransmission/write just fill a buffer. 
+  // The actual heavy lifting happens during endTransmission().
+  Wire.beginTransmission(DAC_ADDR);
+  Wire.write(byte0);
+  Wire.write(byte1);
+  uint8_t error = Wire.endTransmission();
 
-    // Ramp waveform
-    if (rising) {
-      if (value + step >= 4095) { value = 4095; rising = false; }
-      else value += step;
-    } else {
-      if (value < (uint16_t)step) { value = 0; rising = true; }
-      else value -= step;
-    }
+  // 4. Stop Timing
+  uint32_t tDuration = micros() - tStart;
+  digitalWriteFast(SCOPE_PIN, LOW); // Scope Trigger: FALLING edge = Done
 
-    // Heartbeat print ~10 Hz
-    static elapsedMillis printT;
-    if (printT > 100) {
-      printT = 0;
-      digitalToggle(LED_BUILTIN);
+  // 5. Analysis
+  if (error == 0) {
+    transactionCount++;
+    totalTime += tDuration;
+    if (tDuration > maxTime) maxTime = tDuration;
+    if (tDuration < minTime) minTime = tDuration;
+  }
 
-      // Estimate output voltage assuming Vref = 3.3V
-      float v = (3.3f * (float)value) / 4095.0f;
-      Serial.printf("DAC addr=0x%02X value=%4u  ~Vout=%.3f V\n", g_dacAddr, value, v);
-    }
+  // 6. Report every 1 second
+  if (millis() - lastPrint >= 1000) {
+    float avgTime = (float)totalTime / (float)transactionCount;
+    
+    Serial.printf("--- 1s Benchmark ---\n");
+    Serial.printf("Updates/Sec (Hz): %u\n", transactionCount);
+    Serial.printf("Avg Time: %.2f us\n", avgTime);
+    Serial.printf("Min Time: %u us\n", minTime);
+    Serial.printf("Max Time: %u us\n", maxTime);
+    
+    // Reset counters
+    transactionCount = 0;
+    totalTime = 0;
+    maxTime = 0;
+    minTime = 9999;
+    lastPrint = millis();
+    digitalToggle(LED_BUILTIN); // Heartbeat
   }
 }
