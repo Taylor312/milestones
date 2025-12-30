@@ -113,107 +113,120 @@ int32_t readChannel() {
     return val;
 }
 
+// ... (Keep your existing Includes, Defines, and Settings) ...
+// ... (Keep waitDRDY, readRegister, writeRegister, readChannel as they were) ...
+
+// --- IMPROVED INIT with VERIFICATION ---
 void initADS() {
     pinMode(PIN_CS, OUTPUT);
-    pinMode(PIN_DRDY, INPUT); // If using interrupt, use INPUT_PULLUP if open drain, but ADS drives it.
+    pinMode(PIN_DRDY, INPUT);
     digitalWrite(PIN_CS, HIGH);
 
     if (PIN_RST != -1) {
         pinMode(PIN_RST, OUTPUT);
         digitalWrite(PIN_RST, LOW);
-        delay(10);
+        delay(10);             // Longer Reset hold
         digitalWrite(PIN_RST, HIGH);
-        delay(100);
+        delay(500);            // Massive delay to let chip wake up completely
     }
 
     SPI.begin();
     delay(100);
 
-    // Hard Reset Command Sequence
+    // 1. Hard Reset Command
     SPI.beginTransaction(adsSettings);
     digitalWrite(PIN_CS, LOW);
-    delayMicroseconds(2);
-    SPI.transfer(0xFE); // RESET command (rarely used but good practice)
+    delayMicroseconds(5);
+    SPI.transfer(0xFE); // RESET
     delay(5);
     digitalWrite(PIN_CS, HIGH);
     SPI.endTransaction();
+    
+    delay(500); // Wait for reset to complete
 
-    // 1. Set Status Register: Auto-Calibration ON, Buffer OFF
-    // Bit 2 = ACAL, Bit 1 = BUFFER
-    writeRegister(REG_STATUS, 0x04); 
+    // 2. Configure Registers (Retry Loop)
+    // We want Gain=64 (0x25). If we read back 0x20 (Gain 1), we failed.
+    bool configSuccess = false;
+    while (!configSuccess) {
+        Serial.println("Attempting to set Gain 64...");
+        
+        writeRegister(REG_STATUS, 0x04); // Auto-Cal enabled
+        writeRegister(REG_MUX, 0x01);    // Diff inputs
+        writeRegister(REG_ADCON, 0x25);  // Gain = 64
+        writeRegister(REG_DRATE, 0xB0);  // 1000 SPS
 
-    // 2. Set MUX: Positive=AIN0, Negative=AIN1 (Differential)
-    writeRegister(REG_MUX, 0x01);
+        delay(100); // Let settings settle
 
-    // 3. Set ADCON (PGA): Gain = 64
-    // 0x00=1, 0x01=2 ... 0x05=64. Clock Out OFF.
-    writeRegister(REG_ADCON, 0x25); 
+        // Verify
+        uint8_t currentGain = readRegister(REG_ADCON);
+        if (currentGain == 0x25) {
+            configSuccess = true;
+            Serial.println("✅ Gain set to 64 successfully!");
+        } else {
+            Serial.printf("❌ Gain Write Failed! Read: 0x%02X. Retrying...\n", currentGain);
+            delay(1000);
+        }
+    }
 
-    // 4. Set DRATE (Data Rate): 1000 SPS
-    // 0xB0 = 1000 SPS. 0xA1 = 100 SPS (lower noise). 0xF0 = 30kSPS (fastest).
-    writeRegister(REG_DRATE, 0xB0); 
-
-    // 5. Perform Self Calibration
+    // 3. Self Cal
     SPI.beginTransaction(adsSettings);
     digitalWrite(PIN_CS, LOW);
     SPI.transfer(CMD_SELFCAL);
-    waitDRDY(); // Wait for cal to finish
+    waitDRDY();
     digitalWrite(PIN_CS, HIGH);
     SPI.endTransaction();
 }
 
-// --- MAIN ROUTER FUNCTIONS ---
+// --- FILTER SETTINGS ---
+// Exponential Moving Average (EMA)
+// 1.0 = No filter (Raw). 0.1 = Heavy smoothing.
+// 0.3 is a good balance for mechanical testing.
+const float FILTER_ALPHA = 0.3f; 
+float filteredVoltage = 0.0f;
 
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 2000);
-    
-    Serial.println("\n[M3] ADS1256 Load Cell Bringup");
-    Serial.println("Config: Diff Mode (AIN0-AIN1), Gain=64, 1000 SPS");
-    
+
+    Serial.println("\n[M3] Load Cell Setup (Gain Verify Mode)");
     initADS();
     
-    // Verify connection by reading back status
-    uint8_t status = readRegister(REG_STATUS);
-    Serial.printf("ADS1256 Status Reg: 0x%02X (Expected ~0x04 or 0x00)\n", status);
-    
-    Serial.println("Send 't' to Tare (Zero).");
+    Serial.println("Send 't' to Tare.");
 }
+// --- CALIBRATION ---
+const float CALIBRATION_FACTOR = 21820.0f; 
+
+// ... (Rest of setup same as before) ...
 
 void loop() {
     static elapsedMillis printTimer;
     
-    // If Data Ready is LOW, new data is available
-    // (Polling mode for simplicity in this milestone)
     if (digitalRead(PIN_DRDY) == LOW) {
         int32_t raw = readChannel();
-        
-        // Simple Tare Logic
+
         if (tareRequested) {
             tareOffset = raw;
             tareRequested = false;
-            Serial.println("--- TARE COMPLETED ---");
+            Serial.println("--- TARE ---");
         }
 
-        rawValue = raw - tareOffset;
+        int32_t taredRaw = raw - tareOffset;
 
-        // Convert to Voltage (approximate)
-        // Vref = 5.0V, PGA = 64. Full scale 24-bit is +/- (5V/64)
-        // LSB = (2 * 5.0 / 64) / (2^23 - 1) approx.
-        // Simplified: (Raw / 0x7FFFFF) * (5.0 / 64)
-        voltage = ((float)rawValue / 8388607.0f) * (5.0f / 64.0f);
-    }
+        // Convert to Voltage
+        float currentVoltage = ((float)taredRaw / 8388607.0f) * (5.0f / 64.0f);
 
-    // Print Telemetry @ 10 Hz
-    if (printTimer >= 100) {
-        printTimer = 0;
-        
-        // Check for serial command
-        if (Serial.available()) {
-            char c = Serial.read();
-            if (c == 't') tareRequested = true;
+        // Filter (EMA)
+        filteredVoltage = (FILTER_ALPHA * currentVoltage) + ((1.0f - FILTER_ALPHA) * filteredVoltage);
+
+        // Convert to kg using new Factor
+        float kg = filteredVoltage * CALIBRATION_FACTOR *-1.0f;
+
+        if (printTimer >= 100) {
+            printTimer = 0;
+            if (Serial.available()) { if(Serial.read() == 't') tareRequested = true; }
+            
+            // Print
+            Serial.printf("Raw: %ld  \t Kg: %.4f\n", taredRaw, kg);
         }
-
-        Serial.printf("Raw: %ld \t Voltage: %.6f V\n", rawValue, voltage);
     }
-}
+} 
