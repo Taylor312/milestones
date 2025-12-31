@@ -8,8 +8,6 @@
   #include "loadcell/app.cpp" 
 #elif defined(MILESTONE_ENCODER)
   #include "encoder/app.cpp"  
-#elif defined(MILESTONE_TEMP)
-  #include "temp/app.cpp"     
 #elif defined(MILESTONE_RS422)
   #include "rs422/app.cpp"    
 #elif defined(MILESTONE_VESC_CAN)
