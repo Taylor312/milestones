@@ -45,7 +45,7 @@ volatile bool pulsesEnabled = false;
 
 // Speed Config
 // 500us toggle = 1000us period = 1 kHz Step Rate
-unsigned int pulseIntervalUs = 500; 
+unsigned int pulseIntervalUs = 1000; 
 
 // --- ISR: STEP GENERATOR ---
 void stepISR() {
