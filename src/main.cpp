@@ -12,6 +12,10 @@
   #include "rs422/app.cpp"    
 #elif defined(MILESTONE_VESC_CAN)
   #include "vesc_can/app.cpp" 
+#elif defined(MILESTONE_ETHERNET)
+  #include "ethernet/app.cpp"  
+#elif defined(MILESTONE_DYNO_MASTER)
+  #include "dyno_master/app.cpp"
 #else
   void setup() {}
   void loop() {}
